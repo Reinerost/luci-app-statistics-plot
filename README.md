@@ -1,136 +1,111 @@
-# Backups
+# luci-app-statistics-plot
 
-The backup scheme implemented in `/etc/init.d/luci_statistics` aims to
-limit writes to stable storage, to preserve flash memory lifetime.
-(Flash-memory based routers may have limited lifetime of write cycles,
-we want to conserve those.)  While it would be simpler to run a periodic
-backup as a cron job, you'd risk wearing out the flash memory.  This
-scheme only writes backups to flash during shutdowns/reboots and
-upgrades.
+Proof of concept for displaying OpenWrt LuCI Statistics using client-side SVG plots instead of RRDtool-generated graph images.
 
-The backup is only enabled if the administrator sets
-`luci_statistics.collectd_rrdtool.backup=1`.
+## Overview
 
-We only want to restore a sysupgrade backup file if:
+This project is a modified version of OpenWrt's `luci-app-statistics`.
 
-1. It was installed by `sysupgrade -r` (restore configuration files), and
-   we have rebooted.  In this case, there is an orderly shutdown that calls
-   the shutdown methods.  We do not want to overwrite the
-   restored sysupgrade backup file during shutdown, but after reboot we
-   do want to restore it.
+The original application uses the RRDtool command-line utility to generate graph images on the router.
 
-1. It was generated during a true sysupgrade, and we are rebooting into
-   the new image: `sysupgrade` with any or none of `-o`, `-c`, `-f`,
-   `-u`, resulting in a new image being installed and a config file
-   being preserved for processing after reboot.  In this case we do not
-   want to overwrite the backup while rebooting during the upgrade.
-   `sysupgrade` in this case stores a `.tgz` archive of all preserved
-   files where it can be found after rebooting into the new image, and
-   it does not run the shutdown scripts before rebooting.
+This implementation retrieves numerical data through a native `rpcd` plugin and renders interactive SVG diagrams using `luci-plot`.
 
-When the administrator runs `sysupgrade -b` (command line or LuCI), we
-create a sysupgrade backup file and it is included in the combined
-backup.  Then the system continues running.  When we later stop or
-restart or reboot (orderly conditions, when
-`/etc/init.d/luci_statistics` is called to shut down), we do not want to
-use the saved sysupgrade backup.  If we had a control path after
-`sysupgrade -b` that would allow us to remove the sysupgrade backup, this
-would be simple.  But we don't!
+The existing collectd infrastructure, RRD databases and LuCI statistics definitions are retained.
 
-What we *can* do is arrange that a sysupgrade backup contains enough
-information to indicate if it should be restored.
+## Architecture
 
-1. True sysupgrade is straightforward: we arrange that the backed-up
-   file list only includes the sysupgrade backup file and one twin file
-   (see below).  The next starting of `/etc/init.d/luci_statistics`
-   after a sysupgrade will restore the sysupgrade backup.
+```text
+collectd
+   |
+   v
+RRD database files
+   |
+   v
+librrd / rrd_xport()
+   |
+   v
+rrd-ubus (rpcd plugin)
+   |
+   | ubus JSON response
+   v
+luci-app-statistics
+   |
+   v
+luci-lib-plot
+   |
+   v
+SVG diagrams in the browser
+```
 
-1. Continued system operation after `sysupgrade -b`: next time we stop the
-   service (during reboot or during other init script actions), we check
-   for a stale sysupgrade backup, and if we detect it we remove it.
+## Goals
 
-1. `sysupgrade -r` only unpacks the backup files, it does not erase
-   other non-backed-up files still in the overlay.  Its intended use is
-   to then immediately reboot, which will run an orderly shutdown/normal
-   backup.  We must ensure the orderly shutdown in this case preserves
-   the sysupgrade backup, unlike the previous case.
+- Replace server-side RRDtool graph generation
+- Reuse existing collectd RRD databases
+- Preserve existing LuCI statistics configuration
+- Reuse existing diagram definitions where possible
+- Render graphs directly in the browser
+- Reduce dependence on RRDtool's graphics components
 
-To implement these cases, we use a pair of twinned files, only one of
-which is included in the list of files preserved by sysupgrade.  If we
-detect mismatched files (or only one file present) during service
-shutdown or startup, we trust that the sysupgrade backup should be kept
-and restored.  If the files are matched, that indicates that we have not
-restored files since the sysupgrade backup, and the current normal
-backup should be used instead.
+## Implementation
 
-## During sysupgrade backup
+The modified `statistics/rrdtool.js` requests data through:
 
-`/etc/init.d/luci_statistics sysupgrade_backup` is invoked by sysupgrade
-for true upgrade or for the `-l` or `-b` flags.  We detect the list flag
-(`-l`) by checking the process environment, and if found, we only
-generate a list: we don't actually do a backup.  For all cases, we edit
-the list of files listed already and remove any other mentions of
-`/etc/luci_statistics` to ensure that only the backup file and one of
-the twin files is in the backup list.
+```javascript
+rpc.declare({
+    object: 'rrd',
+    method: 'xport',
+    params: ['start', 'end', 'step', 'definitions']
+});
+```
 
-## During sysupgrade
+The frontend constructs RRDtool export definitions from the existing statistics configuration and converts the returned data into series for `luci-plot`.
 
-During a true sysupgrade, only the sysupgrade backup file and one of the
-twin files is restored after the image reboots, so the first running of
-startup scripting will restore the sysupgrade backup.  This could be at
-the time of first boot, if the image has been built to include this
-package, or it could be later when the package is downloaded, installed,
-and the service is started.
+The `rrd.xport` call returns numerical data rather than a PNG or other graph image.
 
-## During backup (including orderly shutdown)
+## Dependencies
 
-During backup (run during shutdown), if there is a matched set of twins,
-then we know that sometime since the last service start the
-administrator ran `sysupgrade -b` and had the chance to copy the
-resulting backup.  We can now erase the twins and the sysupgrade backup.
+- OpenWrt with LuCI
+- `collectd`
+- `collectd-mod-rrdtool`
+- `rrd-ubus`
+- `luci-lib-plot`
 
-If there is a mismatched set of twins, then someone restored a backup
-such as with `sysupgrade -r` and we should now be rebooting, so we
-should leave the sysupgrade files alone to be processed on service
-restart (after reboot).
+The initial implementation uses a custom RRDtool library build for the native export plugin.
 
-If someone takes a `sysupgrade -b` backup and then restores it before
-they reboot or restart statistics, the twins will still match, and we
-then don't keep the statistics from the restored backup, we instead take
-a new backup from current data and use that on reboot.
+## Current Status
 
-## During startup
+**Working proof of concept.**
 
-If there are matched twin files (the normal case for shutdown/reboot
-without sysupgrade), then the sysupgrade backup is ignored and the
-regular backup is restored.  If there are mismatched twin files, then
-the sysupgrade backup is restored.
+Successfully demonstrated:
 
-## During disorderly reboot
+- Retrieval of real CPU statistics through `rrd.xport`
+- JSON data transfer through ubus
+- SVG graph rendering using `luci-plot`
+- Seven CPU data series with individual colors
+- Integration with the existing LuCI Statistics interface
+- Dynamic export step calculation based on the selected time range
 
-In a system crash or other disorderly reboot, the shutdown scripts do
-not run.  What remains on the system is the previous contents of
-`/etc/luci_statistics`.
+The implementation has been tested on an OpenWrt device using real collectd data.
 
-* If the system never started luci_statistics, or it was cleanly shut
-  down before the crash, then there is no difference in behavior from
-  normal startup: we restore either the sysupgrade backup (if
-  luci_statistics had never run) or the regular backup (if
-  luci_statistics was cleanly stopped)
+## Known Limitations and Remaining Work
 
-* If luci_statistics and collectd were running at the time of the crash,
-  there could be a regular backup and a sysupgrade backup present, plus
-  volatile data in /tmp (which are lost in the crash).  The regular
-  backup would be from the most recent time the system cleanly stopped
-  luci_statistics.  During the subsequent reboot/service start up:
+- Not all existing statistics diagram definitions have been tested
+- Time ranges from one hour to one year require further testing
+- Calculated series and special graph configurations need verification
+- Error handling and edge cases need further work
+- The native RRD export plugin requires additional validation and security review
+- Packaging and dependencies need review before upstream integration
 
-  * If there is a sysupgrade backup on disk from having run `sysupgrade
-    -b`, with both twin files matching (meaning the administrator had
-    taken a backup sometime during the life of the system, before the
-    crash), they are ignored and a regular backup (if any) is restored.
+This repository is intended to preserve and develop the proof of concept. It is not currently a drop-in replacement for the official OpenWrt package.
 
-  * If the sysupgrade backup has mismatched twin files or only one twin,
-	then it is used to restore state.  This would be the case if a
-	sysupgrade restored configuration (`sysupgrade -r`), whether or not
-	it did an orderly shutdown/reboot, or if the file system were
-	damaged in a crash and only one of the twin files survived.
+## Related Projects
+
+- [rrd-ubus](https://github.com/Reinerost/rrd-ubus) — native RRD export plugin
+- [luci-plot](https://github.com/Reinerost/luci-plot) — SVG plotting library
+- [luci-plot-module](https://github.com/Reinerost/luci-plot-module) — LuCI integration of the plotting library
+- [OpenWrt LuCI](https://github.com/openwrt/luci) — upstream LuCI project
+
+## License
+
+This project is derived from OpenWrt LuCI. The applicable upstream license and copyright notices must be preserved.
+
