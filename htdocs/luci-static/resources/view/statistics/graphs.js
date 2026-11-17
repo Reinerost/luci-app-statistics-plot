@@ -164,14 +164,14 @@ return view.extend({
 		const render_instances = (activeInstance || '').split(/\|/);
 
 		return Promise.all(render_instances.map(render_instance =>
-		rrdtool.render(
-			activePlugin,
-			render_instance || '',
-			div.hasAttribute('data-is-index'),
-					   host.value,
-				 span.value,
-				 width
-		)
+			rrdtool.render(
+				activePlugin,
+				render_instance || '',
+				div.hasAttribute('data-is-index'),
+				host.value,
+				span.value,
+				width
+			)
 		)).then(results => {
 			const diagrams = [].concat(...results);
 
